@@ -9,6 +9,12 @@ type SocksInboundOptions struct {
 	ListenOptions
 	Users          []auth.User           `json:"users,omitempty"`
 	DomainResolver *DomainResolveOptions `json:"domain_resolver,omitempty"`
+	// UDPShared relays socks5 UDP over the inbound's own listen port
+	// (shared-socket model, like Xray) instead of per-associate
+	// ephemeral sockets on random ports. UDP ASSOCIATE replies with
+	// the shared port; inbound packets are attributed to users by
+	// source IP lookup against active TCP associates.
+	UDPShared bool `json:"udp_shared,omitempty"`
 }
 
 type HTTPMixedInboundOptions struct {

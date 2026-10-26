@@ -17,6 +17,7 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/common/udpnat2"
 	"github.com/sagernet/sing/protocol/socks"
 )
 
@@ -28,11 +29,15 @@ var _ adapter.TCPInjectableInbound = (*Inbound)(nil)
 
 type Inbound struct {
 	inbound.Adapter
+	ctx           context.Context
 	router        adapter.ConnectionRouterEx
 	logger        logger.ContextLogger
 	listener      *listener.Listener
 	authenticator *auth.Authenticator
 	udpTimeout    time.Duration
+	udpShared     bool
+	udpNat        *udpnat.Service
+	clients       *udpClientRegistry
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SocksInboundOptions) (adapter.Inbound, error) {
@@ -42,20 +47,34 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	} else {
 		udpTimeout = C.UDPTimeout
 	}
+	networks := []string{N.NetworkTCP}
+	if options.UDPShared {
+		networks = append(networks, N.NetworkUDP)
+	}
 	inbound := &Inbound{
 		Adapter:       inbound.NewAdapter(C.TypeSOCKS, tag),
+		ctx:           ctx,
 		router:        uot.NewRouter(router, logger),
 		logger:        logger,
 		authenticator: auth.NewAuthenticator(options.Users),
 		udpTimeout:    udpTimeout,
+		udpShared:     options.UDPShared,
 	}
-	inbound.listener = listener.New(listener.Options{
+	if options.UDPShared {
+		inbound.clients = newUDPClientRegistry()
+		inbound.udpNat = udpnat.New(inbound, inbound.preparePacketConnection, udpTimeout, true)
+	}
+	listenerOptions := listener.Options{
 		Context:           ctx,
 		Logger:            logger,
-		Network:           []string{N.NetworkTCP},
+		Network:           networks,
 		Listen:            options.ListenOptions,
 		ConnectionHandler: inbound,
-	})
+	}
+	if options.UDPShared {
+		listenerOptions.PacketHandler = inbound
+	}
+	inbound.listener = listener.New(listenerOptions)
 	return inbound, nil
 }
 
@@ -67,11 +86,19 @@ func (h *Inbound) Start(stage adapter.StartStage) error {
 }
 
 func (h *Inbound) Close() error {
+	if h.udpNat != nil {
+		h.udpNat.Purge()
+	}
 	return h.listener.Close()
 }
 
 func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
-	err := socks.HandleConnectionEx(ctx, conn, std_bufio.NewReader(conn), h.authenticator, adapter.NewUpstreamHandlerEx(metadata, h.newUserConnection, h.streamUserPacketConnection), h.listener, h.udpTimeout, metadata.Source, onClose)
+	var err error
+	if h.udpShared {
+		err = h.newSharedConnection(ctx, conn, metadata, onClose)
+	} else {
+		err = socks.HandleConnectionEx(ctx, conn, std_bufio.NewReader(conn), h.authenticator, adapter.NewUpstreamHandlerEx(metadata, h.newUserConnection, h.streamUserPacketConnection), h.listener, h.udpTimeout, metadata.Source, onClose)
+	}
 	N.CloseOnHandshakeFailure(conn, onClose, err)
 	if err != nil {
 		if E.IsClosedOrCanceled(err) {
